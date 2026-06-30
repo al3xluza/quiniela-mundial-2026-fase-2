@@ -162,7 +162,7 @@ input[type="number"]{-moz-appearance:textfield}
 // CONFIG
 // ==========================================
 const SHEET_ID = "1rlfScbfGZdte0JxGwA3NmHr_08wFgmLTk-c2SyvlLzA";
-const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyBG7rODG-uPsOdYwYj94uz0QI2GItJgI9M5PDu_ajGrFVZR2P0SIpP6wWTys4FhiU/exec";
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwVtJzpnfBjfqH-YCx_y7JuN6hJIYlq6GbCKq7KYu2XsmRST448gjlI7wscXC5Bdn5p/exec";
 
 let DATA = { matches: [] };
 let RESULTS = {};
@@ -175,7 +175,153 @@ let lastUpdate = null;
 let activeTab = 'tabla';
 let gruposFilterDate = null;
 let SIMULATED_RESULTS = {};
-let OPEN_PREDICTIONS_ID = null;
+// ==========================================
+// EN VIVO — ESPN API + Netlify Proxy
+// ==========================================
+const ESPN_PROXY = '/.netlify/functions/espn';
+const ESPN_NAMES = {
+  'COREA DEL SUR':['south korea','korea republic','korea'],'MEXICO':['mexico'],
+  'REP. CHECA':['czechia','czech republic'],'SUDAFRICA':['south africa'],
+  'BOSNIA-HERZEGOVINA':['bosnia','bosnia and herzegovina'],'CANADA':['canada'],'QATAR':['qatar'],'SUIZA':['switzerland'],
+  'BRASIL':['brazil'],'ESCOCIA':['scotland'],'HAITI':['haiti'],'MARRUECOS':['morocco'],
+  'AUSTRALIA':['australia'],'PARAGUAY':['paraguay'],'TURQUIA':['turkey','türkiye'],'USA':['united states','usa'],
+  'ALEMANIA':['germany'],'COSTA DE MARFIL':['ivory coast','cote divoire'],'CURAZAO':['curacao','curaçao'],'ECUADOR':['ecuador'],
+  'HOLANDA':['netherlands','holland'],'JAPON':['japan'],'SUECIA':['sweden'],'TUNEZ':['tunisia'],
+  'BELGICA':['belgium'],'EGIPTO':['egypt'],'IRAN':['iran','ir iran'],'NUEVA ZELANDA':['new zealand'],
+  'ARABIA SAUDITA':['saudi arabia'],'CABO VERDE':['cape verde'],'ESPANA':['spain'],'URUGUAY':['uruguay'],
+  'FRANCIA':['france'],'IRAQ':['iraq'],'NORUEGA':['norway'],'SENEGAL':['senegal'],
+  'ARGELIA':['algeria'],'ARGENTINA':['argentina'],'AUSTRIA':['austria'],'JORDANIA':['jordan'],
+  'COLOMBIA':['colombia'],'PORTUGAL':['portugal'],'RD CONGO':['dr congo'],'UZBEKISTAN':['uzbekistan'],
+  'CROACIA':['croatia'],'GHANA':['ghana'],'INGLATERRA':['england'],'PANAMA':['panama']
+};
+
+let ENVIVO_EVENT = null;
+let ENVIVO_TIMER = null;
+let ENVIVO_ACTIVE = false;
+
+function norm(s){ return String(s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z ]/g,'').trim(); }
+function matchesTeam(quinielaName, espnName){
+  const variants = ESPN_NAMES[String(quinielaName||'').toUpperCase().trim()] || [];
+  const en = norm(espnName);
+  return variants.some(v => en===norm(v) || en.includes(norm(v)));
+}
+
+function lvSetStatus(txt, err, panelId='vEnvivo'){
+  const el=document.getElementById(panelId); if(!el) return;
+  el.style.color=err?'var(--red)':'var(--ok)';
+  el.textContent=txt||'';
+}
+
+function lvFlag(name){
+  const iso = FLAGS[String(name||'').toUpperCase().trim()];
+  return iso ? `https://flagcdn.com/w80/${iso}.png` : '';
+}
+
+async function findLiveEvents(){
+  const d=new Date();
+  const ymd=`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+  try{
+    const res=await fetch(`${ESPN_PROXY}?type=scoreboard&dates=${ymd}`);
+    if(!res.ok) throw new Error('scoreboard');
+    const js=await res.json();
+    const events=js.events||[];
+    const live=events.filter(e=>{
+      const st=e.status&&e.status.type&&e.status.type.state;
+      return st==='in';
+    });
+    return live;
+  }catch(e){
+    console.error('ESPN error:',e);
+    return [];
+  }
+}
+
+async function fetchSummary(eventId){
+  try{
+    const res=await fetch(`${ESPN_PROXY}?type=summary&event=${eventId}`);
+    if(!res.ok) throw new Error('summary');
+    return await res.json();
+  }catch(e){
+    console.error('ESPN summary error:',e);
+    return null;
+  }
+}
+
+function renderEnvivo(sum, panelId='vEnvivo'){
+  const el=document.getElementById(panelId); if(!el) return;
+  const comp=sum?.header?.competitions?.[0];
+  if(!comp){
+    el.innerHTML=`<div style="padding:20px;text-align:center;color:rgba(255,255,255,.5)">No hay datos disponibles.</div>`;
+    return;
+  }
+  
+  const cs=comp.competitors||[];
+  const home=cs.find(c=>c.homeAway==='home')||cs[0]||{};
+  const away=cs.find(c=>c.homeAway==='away')||cs[1]||{};
+  const hName=(home.team?.displayName||home.team?.name)||'';
+  const aName=(away.team?.displayName||away.team?.name)||'';
+  const hLogo=(home.team?.logos?.[0]?.href)||(home.team?.logo)||lvFlag(hName);
+  const aLogo=(away.team?.logos?.[0]?.href)||(away.team?.logo)||lvFlag(aName);
+  const hScore=home.score!=null?home.score:'0';
+  const aScore=away.score!=null?away.score:'0';
+  
+  const st=comp.status||{};
+  const stType=st.type||{};
+  const isFinal=stType.completed===true||stType.state==='post';
+  const clockTxt=isFinal?'Final':(st.displayClock||'En juego');
+  
+  let h=`<div style="padding:20px">`;
+  h+=`<div style="display:grid;grid-template-columns:1fr 100px 1fr;gap:20px;align-items:center;margin-bottom:30px">`;
+  h+=`<div style="text-align:right"><img src="${hLogo}" style="width:60px;height:60px;object-fit:cover;border-radius:50%;margin-bottom:10px" alt=""><div style="font-weight:600;font-size:16px">${hName}</div></div>`;
+  h+=`<div style="text-align:center"><div style="font-family:'JetBrains Mono';font-size:48px;font-weight:700;color:var(--gold)">${hScore} - ${aScore}</div><div style="font-size:13px;color:rgba(255,255,255,.7);margin-top:8px">${isFinal?'Final':'<span style="color:var(--red)">● EN VIVO</span>'}</div><div style="font-size:12px;color:rgba(255,255,255,.5)">${clockTxt}</div></div>`;
+  h+=`<div style="text-align:left"><img src="${aLogo}" style="width:60px;height:60px;object-fit:cover;border-radius:50%;margin-bottom:10px" alt=""><div style="font-weight:600;font-size:16px">${aName}</div></div>`;
+  h+=`</div>`;
+  
+  const events=comp.videos||comp.articles||[];
+  if(events.length){
+    h+=`<div style="background:var(--board);border:1px solid var(--line);border-radius:8px;padding:15px">`;
+    h+=`<div style="font-weight:600;margin-bottom:10px;font-size:13px;text-transform:uppercase;letter-spacing:.08em">Eventos</div>`;
+    events.slice(0,10).forEach(e=>{
+      const desc=e.description||e.headline||'Evento';
+      h+=`<div style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:13px">${desc}</div>`;
+    });
+    h+=`</div>`;
+  }
+  
+  h+=`</div>`;
+  el.innerHTML=h;
+}
+
+async function updateEnvivo(){
+  try{
+    const live=await findLiveEvents();
+    if(!live.length){
+      if(ENVIVO_ACTIVE){
+        ENVIVO_ACTIVE=false;
+        document.getElementById('tab-envivo').style.display='none';
+        clearInterval(ENVIVO_TIMER);
+      }
+      return;
+    }
+    
+    if(!ENVIVO_ACTIVE){
+      ENVIVO_ACTIVE=true;
+      document.getElementById('tab-envivo').style.display='block';
+    }
+    
+    ENVIVO_EVENT=live[0].id;
+    const sum=await fetchSummary(ENVIVO_EVENT);
+    if(sum) renderEnvivo(sum,'vEnvivo');
+  }catch(e){
+    console.error('EN VIVO error:',e);
+  }
+}
+
+function startEnvivoRefresh(){
+  clearInterval(ENVIVO_TIMER);
+  updateEnvivo();
+  ENVIVO_TIMER=setInterval(updateEnvivo, 20*1000);
+}
 
 // Mapa de banderas
 const FLAGS = {
@@ -204,11 +350,71 @@ function flagImg(name, side){
 // ==========================================
 // CARGAR DATOS DESDE GOOGLE SHEETS
 // ==========================================
+async function loadPartidos(){
+  try{
+    const base=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&headers=1`;
+    const txt=await (await fetch(base+'&sheet=RESULTADOS')).text();
+    if(txt.indexOf('"errors"')!==-1) throw new Error('No hay datos');
+    
+    const js=JSON.parse(txt.substring(txt.indexOf('(')+1, txt.lastIndexOf(')')));
+    const matches=[];
+    (js.table.rows||[]).forEach((row,idx)=>{
+      const c=row.c||[];
+      const id=c[0]&&c[0].v!=null?Number(c[0].v):null;
+      const fecha=c[1]&&c[1].v!=null?String(c[1].v):'';
+      const hora=c[2]&&c[2].v!=null?String(c[2].v):'';
+      const t1=c[3]&&c[3].v!=null?String(c[3].v):'';
+      const t2=c[4]&&c[4].v!=null?String(c[4].v):'';
+      const round=c[8]&&c[8].v!=null?String(c[8].v):'R32';
+      const stadium=c[9]&&c[9].v!=null?String(c[9].v):'';
+      
+      if(id!=null && t1 && t2){
+        matches.push({id, date:fecha, time:hora, t1, t2, round, stadium});
+      }
+    });
+    DATA.matches=matches;
+  }catch(e){
+    console.error('Error loading partidos:',e);
+  }
+}
+
+async function loadPredicciones(){
+  try{
+    const base=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&headers=1`;
+    const txt=await (await fetch(base+'&sheet=PREDICCIONES')).text();
+    if(txt.indexOf('"errors"')!==-1) throw new Error('No hay predicciones');
+    
+    const js=JSON.parse(txt.substring(txt.indexOf('(')+1, txt.lastIndexOf(')')));
+    const preds={};
+    const headerRow=js.table.rows[0]?.c||[];
+    const participantes=headerRow.slice(1).map(h=>h?.v||'').filter(x=>x);
+    
+    (js.table.rows||[]).forEach((row,rowIdx)=>{
+      if(rowIdx===0) return;
+      const c=row.c||[];
+      const matchId=c[0]&&c[0].v!=null?Number(c[0].v):null;
+      if(matchId===null) return;
+      
+      participantes.forEach((pname,colIdx)=>{
+        if(!preds[pname]) preds[pname]={};
+        const predStr=c[colIdx+1]&&c[colIdx+1].v!=null?String(c[colIdx+1].v):'';
+        const [g1,g2]=predStr.split('-').map(x=>parseInt(x.trim())||0);
+        if(Number.isFinite(g1)&&Number.isFinite(g2)){
+          preds[pname][matchId]=[g1,g2];
+        }
+      });
+    });
+    PREDICCIONES=preds;
+  }catch(e){
+    console.error('Error loading predicciones:',e);
+  }
+}
+
 async function loadResults(showNote=true){
   try{
     const base=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&headers=1`;
     
-    // Cargar RESULTADOS (Fase 2 - Knockout rounds)
+    // Cargar RESULTADOS
     const txt=await (await fetch(base+'&sheet=RESULTADOS')).text();
     if(txt.indexOf('"errors"')!==-1) throw new Error('No hay datos');
     
@@ -422,12 +628,13 @@ function calcPoints(pred,result){
 }
 
 // ==========================================
-// RENDER PARTIDOS (con banderas)
+// RENDER PARTIDOS (con banderas) - SOLO FASE 2
 // ==========================================
 function renderPartidos(){
   const byDate={};
   const fechasSet=new Set();
-  DATA.matches.forEach(m=>{
+  // Filtrar solo Fase 2 (IDs >= 72)
+  DATA.matches.filter(m=>m.id>=72).forEach(m=>{
     (byDate[m.date]=byDate[m.date]||[]).push(m);
     fechasSet.add(m.date);
   });
@@ -615,14 +822,17 @@ function renderInstrucciones(){
 // ==========================================
 // STARTUP
 // ==========================================
-window.addEventListener('load',()=>{
-  // Cargar datos vacíos por defecto (será reemplazado con Google Sheets)
-  renderAll();
+window.addEventListener('load',async ()=>{
+  setNote('Cargando datos...','');
+  await loadPartidos();
+  await loadPredicciones();
+  await loadResults(true);
   renderInstrucciones();
-  loadResults(true);
+  startEnvivoRefresh();
 });
 
-setInterval(()=>loadResults(true),60*1000);
+setInterval(()=>loadResults(false),60*1000);
+setInterval(updateEnvivo,20*1000);
 
 </script>
 
